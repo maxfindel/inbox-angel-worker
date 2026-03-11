@@ -1,0 +1,134 @@
+{
+	// ── Self-hosting checklist ──────────────────────────────────────────────────
+	// 1. Replace "inbox-angel-worker" below with your own worker name
+	// 2. Run: wrangler d1 create <your-db-name>  → paste database_id below
+	// 3. Set REPORTS_DOMAIN to the subdomain you'll receive reports on
+	//    (e.g. "reports.yourdomain.com") — must be on your CF zone
+	// 4. Set FROM_EMAIL to any address on that domain
+	// 5. Set CUSTOMER_DOMAIN, CUSTOMER_EMAIL, CUSTOMER_NAME below
+	//    (auto-provisioned on first authenticated request — no API call needed)
+	//
+	// ── DEPLOY token (wrangler deploy + D1 migrations) ─────────────────────────
+	//    Create at: dash.cloudflare.com → My Profile → API Tokens
+	//    Account scope (Fellowship.dev):
+	//      • Account Settings : Read   ← lets wrangler skip /memberships lookup
+	//      • Workers Scripts  : Edit
+	//      • D1               : Edit
+	//    Zone scope (All zones):
+	//      • Workers Routes   : Edit   ← required for custom domain route
+	//    Set it: export CLOUDFLARE_API_TOKEN=<deploy-token>
+	//
+	// ── EMAIL token (email routing + DNS provisioning + runtime DNS writes) ─────
+	//    Create at: same place
+	//    Account scope (Fellowship.dev):
+	//      • Account Settings : Read
+	//      • Email Sending    : Edit   ← send from Email Workers
+	//    Zone scope (All zones):
+	//      • Zone                : Read  ← auto-discover zone ID + account ID at runtime
+	//      • Email Routing Rules : Edit  ← enable routing, set catch-all rule
+	//      • DNS                 : Edit  ← MX records for subdomain + per-customer TXT records
+	//      • Workers Routes      : Edit
+	//    Run once: CLOUDFLARE_EMAIL_TOKEN=<token> REPORTS_DOMAIN=<domain> npx tsx scripts/setup-email-routing.ts
+	//      → enables Email Routing on the zone
+	//      → adds MX records for REPORTS_DOMAIN subdomain
+	//      → sets catch-all rule: *@REPORTS_DOMAIN → this Worker
+	//    After running, update your domain's DMARC record — append rua, don't replace:
+	//      _dmarc.yourdomain.com TXT "v=DMARC1; p=none; rua=mailto:<existing>,mailto:rua@REPORTS_DOMAIN"
+	//    Then store as runtime secret: wrangler secret put CLOUDFLARE_API_TOKEN
+	//      (runtime token = EMAIL token — deploy token is only needed locally/CI)
+	//
+	// 6. Set secrets (run each, paste value when prompted):
+	//      wrangler secret put CLOUDFLARE_API_TOKEN ← EMAIL token (from step above)
+	//      wrangler secret put BASE_DOMAIN          ← your root domain (e.g. yourdomain.com)
+	//
+	//    That's it — everything else auto-derives:
+	//      REPORTS_DOMAIN     = reports.<BASE_DOMAIN>                 (override: wrangler secret put REPORTS_DOMAIN)
+	//      FROM_EMAIL         = noreply@reports.<BASE_DOMAIN>         (override: wrangler secret put FROM_EMAIL)
+	//      CUSTOMER_NAME      = "Self-hosted"                         (override: wrangler secret put CUSTOMER_NAME)
+	//      CUSTOMER_EMAIL     = <FROM_EMAIL>                          (override: wrangler secret put CUSTOMER_EMAIL)
+	// 7. Create workers.dev subdomain (required for cron scheduling — no dashboard visit needed):
+	//      curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/<account_id>/workers/subdomain" \
+	//        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+	//        -H "Content-Type: application/json" \
+	//        -d '{"subdomain":"<your-chosen-name>"}'
+	// 8. npm run migrate && npm run deploy
+	// ───────────────────────────────────────────────────────────────────────────
+
+	"name": "inbox-angel-worker",   // ← step 1: change to your worker name
+	"main": "src/index.ts",
+	"build": {
+		"command": "npm install --prefix dashboard && npm run build:dashboard"
+	},
+	"assets": {
+		"directory": "./dashboard/dist",
+		"not_found_handling": "single-page-application"
+	},
+	"compatibility_date": "2025-03-01",
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": {
+		"enabled": true
+	},
+
+	// D1 database binding
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "inbox-angel",      // ← step 3a: change to your DB name
+			"database_id": "cf18a05c-9f6c-4f38-a43c-d85037d17534",   // ← step 3b: from: wrangler d1 create <name>
+			"migrations_dir": "migrations"
+		}
+	],
+
+	// Email Worker — catch-all on REPORTS_DOMAIN (inbound)
+	"email": [
+		{
+			"name": "EMAIL"
+		}
+	],
+
+	// Outbound email — requires CF Email Routing enabled on your zone.
+	// Recipients must be verified destination addresses in CF Email Routing.
+	// For self-hosting: verify your CUSTOMER_EMAIL in CF dashboard → Email → Routing → Destinations.
+	"send_email": [
+		{
+			"name": "SEND_EMAIL"
+		}
+	],
+
+	// Custom domain route — optional, add if you want a vanity URL instead of workers.dev
+	// Requires your deploy token to have Zone / Workers Routes : Edit
+	// "routes": [
+	// 	{ "pattern": "mail.yourdomain.com/*", "zone_name": "yourdomain.com" }
+	// ],
+
+	// Rate limiting (free tier: 1000 req/10s shared across all limiters)
+	// AUTH_LIMITER: tight — 10 auth attempts per minute per IP
+	// API_LIMITER:  loose — 200 API requests per minute per IP (stops key brute-force, allows normal use)
+	"unsafe": {
+		"bindings": [
+			{ "name": "AUTH_LIMITER", "type": "ratelimit", "namespace_id": "1001", "simple": { "limit": 10,  "period": 60 } },
+			{ "name": "API_LIMITER",  "type": "ratelimit", "namespace_id": "1002", "simple": { "limit": 200, "period": 60 } }
+		]
+	},
+
+	// Crons:
+	//   0 8 * * *  — daily DNS monitor check
+	//   0 9 * * 1  — weekly DMARC digest email (Mondays 9am UTC)
+	//   0 10 * * * — daily SPF flatten refresh (re-resolves IPs for flattened domains)
+	//   0 11 * * * — daily telemetry heartbeat (opt-in anonymous usage stats)
+	"triggers": {
+		"crons": ["0 8 * * *", "0 9 * * 1", "0 10 * * *", "0 11 * * *"]
+	},
+
+	// Environment variables — set these to your values before deploying
+	"vars": {
+		"WORKER_NAME": "inbox-angel-worker",  // must match the "name" field above
+		"TELEMETRY_ENABLED": "true",         // set to "true" to send anonymous usage stats
+		"DEBUG": "true",                     // set to "true" for verbose logs in CF Workers Logs
+		"BASE_DOMAIN": "fellowship.dev"       // required — e.g. "yourdomain.com"
+		// Required secret: CLOUDFLARE_API_TOKEN (see README for token permissions)
+		// Optional overrides (wrangler secret put <NAME>):
+		//   REPORTS_DOMAIN  — override reports subdomain (defaults to reports.<BASE_DOMAIN>)
+		//   FROM_EMAIL      — override sender address
+	}
+}

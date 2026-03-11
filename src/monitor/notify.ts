@@ -1,0 +1,76 @@
+// Change notification emails for domain monitoring.
+// Delivery: Cloudflare Email Workers (SEND_EMAIL binding).
+// Falls back to console.log if binding is absent (wrangler dev has no local send_email support).
+
+import { DomainChange } from './check';
+
+export interface NotifyEnv {
+  SEND_EMAIL?: SendEmail;
+  FROM_EMAIL: string;
+  REPORTS_DOMAIN: string;
+}
+
+const SEVERITY_EMOJI: Record<DomainChange['severity'], string> = {
+  improved: '✅',
+  degraded: '🚨',
+  changed: '⚠️',
+};
+
+function buildEmailBody(domain: string, changes: DomainChange[], reportsDomain: string): string {
+  const lines: string[] = [
+    `We detected changes to the email security configuration of ${domain}.`,
+    '',
+    ...changes.map(c =>
+      `${SEVERITY_EMOJI[c.severity]} ${c.field}\n   Was: ${c.was || '(not set)'}\n   Now: ${c.now || '(removed)'}`
+    ),
+    '',
+  ];
+
+  const hasDegraded = changes.some(c => c.severity === 'degraded');
+  if (hasDegraded) {
+    lines.push(
+      'Some of these changes may leave your domain exposed to spoofing.',
+      'Want us to fix it for you? Reply to this email or sign up at https://' + reportsDomain.replace(/^reports\./, ''),
+      '',
+    );
+  } else {
+    lines.push('No action required — these look like improvements or routine updates.');
+    lines.push('');
+  }
+
+  lines.push('—');
+  lines.push('InboxAngel domain monitoring');
+  lines.push(`To manage alerts for ${domain}: open your dashboard → Domains → ${domain} → Settings.`);
+
+  return lines.join('\n');
+}
+
+export async function sendChangeNotification(
+  email: string,
+  domain: string,
+  changes: DomainChange[],
+  env: NotifyEnv,
+): Promise<void> {
+  const hasDegraded = changes.some(c => c.severity === 'degraded');
+  const subject = hasDegraded
+    ? `⚠️ ${domain} email security degraded`
+    : `${domain} email security updated`;
+
+  const body = buildEmailBody(domain, changes, env.REPORTS_DOMAIN);
+
+  if (!env.SEND_EMAIL) {
+    console.log(`[notify] SEND_EMAIL binding not configured — would send to ${email}: ${subject}\n${body}`);
+    return;
+  }
+
+  try {
+    await env.SEND_EMAIL.send({
+      from: { name: 'InboxAngel', email: env.FROM_EMAIL },
+      to: [email],
+      subject,
+      text: body,
+    });
+  } catch (e) {
+    console.error(`[notify] send failed for ${email}:`, e);
+  }
+}
